@@ -1,0 +1,47 @@
+[project]
+name = "anthem-rs232"
+version = "0.0.0"
+description = "Async library to control Anthem MRX 1120 / 720 / 520 / AVM 60 receivers over RS232"
+readme = "README.md"
+license = "MIT"
+authors = [
+    { name = "Ben Hass", email = "ben@groovie.org" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "serialx[esphome]>=1.2.0",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Home Automation",
+    "Topic :: System :: Hardware",
+    "Framework :: AsyncIO",
+]
+
+[project.scripts]
+anthem-rs232 = "anthem_rs232.__main__:main"
+anthem-rs232-probe = "anthem_rs232.probe:main"
+
+[project.urls]
+Repository = "https://github.com/benhass/anthem-rs232"
+
+[build-system]
+requires = ["uv_build>=0.8.4,<0.9.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0",
+    "pytest-asyncio>=1.0",
+    "pytest-timeout>=2.4.0",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+timeout = 1
