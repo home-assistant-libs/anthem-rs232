@@ -3,6 +3,11 @@
 Usage:
     python -m anthem_rs232 /dev/ttyUSB0
     python -m anthem_rs232 /dev/ttyUSB0 --probe
+    python -m anthem_rs232 /dev/ttyUSB0 --power on
+    python -m anthem_rs232 /dev/ttyUSB0 --power off --zone 2
+    python -m anthem_rs232 /dev/ttyUSB0 --volume -30
+    python -m anthem_rs232 /dev/ttyUSB0 --mute toggle
+    python -m anthem_rs232 /dev/ttyUSB0 --input 2
 """
 
 from __future__ import annotations
@@ -102,22 +107,96 @@ def _print_state(state: ReceiverState) -> None:
     print()
 
 
-async def _run(port: str, probe: bool) -> None:
+def _player_for(receiver: AnthemReceiver, zone: str):
+    """Return the player matching ``--zone main|2``."""
+    if zone == "main":
+        return receiver.main
+    if zone == "2":
+        return receiver.zone_2
+    raise ValueError(f"Unknown zone: {zone}")
+
+
+async def _do_power(receiver: AnthemReceiver, action: str, zone: str) -> None:
+    """Apply ``--power on|off``. ``zone=all`` uses Z0POW for all zones."""
+    if zone == "all":
+        if action == "on":
+            await receiver.power_on_all()
+            # If standby IP control is disabled, the receiver may need the
+            # power-on command twice -- once to wake from low-power state.
+            await asyncio.sleep(1.0)
+            try:
+                if not await receiver.main.query_power():
+                    await receiver.power_on_all()
+            except Exception:  # noqa: BLE001
+                # Some firmwares ignore queries during the wake transition;
+                # retry the power-on once unconditionally and move on.
+                await receiver.power_on_all()
+        else:
+            await receiver.power_off_all()
+        return
+
+    player = _player_for(receiver, zone)
+    if action == "on":
+        await player.power_on()
+        await asyncio.sleep(1.0)
+        try:
+            if not await player.query_power():
+                await player.power_on()
+        except Exception:  # noqa: BLE001
+            await player.power_on()
+    else:
+        await player.power_off()
+
+
+async def _do_mute(receiver: AnthemReceiver, action: str, zone: str) -> None:
+    player = _player_for(receiver, zone)
+    if action == "on":
+        await player.mute_on()
+    elif action == "off":
+        await player.mute_off()
+    else:  # toggle
+        await player.mute_toggle()
+
+
+async def _run(args: argparse.Namespace) -> None:
+    port = args.port
     receiver = AnthemReceiver(port)
 
     print(f"Connecting to {port}...")
     try:
         await receiver.connect()
-        print("Querying receiver state...")
-        await receiver.query_state()
     except ConnectionError as err:
         print(f"Error: {err}", file=sys.stderr)
         sys.exit(1)
 
     try:
+        # Apply actions in a fixed, useful order: power first (so other
+        # commands actually take effect), then input/volume/mute.
+        if args.power is not None:
+            print(f"Setting power: {args.power} (zone={args.zone})")
+            await _do_power(receiver, args.power, args.zone)
+
+        if args.input is not None:
+            print(f"Selecting input: {args.input}")
+            await _player_for(receiver, args.zone if args.zone != "all" else "main").select_input(args.input)
+
+        if args.volume is not None:
+            print(f"Setting volume: {args.volume:+.0f} dB")
+            await _player_for(receiver, args.zone if args.zone != "all" else "main").set_volume(args.volume)
+
+        if args.mute is not None:
+            print(f"Setting mute: {args.mute}")
+            await _do_mute(receiver, args.mute, args.zone if args.zone != "all" else "main")
+
+        # Allow a moment for auto-report frames to land before we query state.
+        if any(v is not None for v in (args.power, args.input, args.volume, args.mute)):
+            await asyncio.sleep(1.0)
+
+        print("Querying receiver state...")
+        await receiver.query_state()
         _print_state(receiver.state)
 
-        if probe:
+        if args.probe:
             print("Probing inputs...")
             inputs = await receiver.probe_inputs()
             print()
@@ -134,16 +213,44 @@ async def _run(port: str, probe: bool) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Test an Anthem MRX 1120 / 720 / 520 / AVM 60 over RS232",
+        description="Control an Anthem MRX 1120 / 720 / 520 / AVM 60 over RS232",
     )
-    parser.add_argument("port", help="Serial port (e.g. /dev/ttyUSB0)")
+    parser.add_argument("port", help="Serial port (e.g. /dev/ttyUSB0) or serialx URL")
+    parser.add_argument(
+        "--power",
+        choices=["on", "off"],
+        help="Power the receiver on or off",
+    )
+    parser.add_argument(
+        "--zone",
+        choices=["main", "2", "all"],
+        default="all",
+        help="Target zone for actions (default: all for --power, main otherwise)",
+    )
+    parser.add_argument(
+        "--input",
+        type=int,
+        metavar="N",
+        help="Select input N (1-based)",
+    )
+    parser.add_argument(
+        "--volume",
+        type=float,
+        metavar="DB",
+        help="Set volume in dB (e.g. -30, 0, +5)",
+    )
+    parser.add_argument(
+        "--mute",
+        choices=["on", "off", "toggle"],
+        help="Set mute state",
+    )
     parser.add_argument(
         "--probe",
         action="store_true",
         help="Probe configured inputs",
     )
     args = parser.parse_args()
-    asyncio.run(_run(args.port, args.probe))
+    asyncio.run(_run(args))
 
 
 if __name__ == "__main__":
