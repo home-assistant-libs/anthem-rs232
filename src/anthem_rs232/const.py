@@ -25,6 +25,15 @@ MAX_FM_FREQUENCY = 108.00
 MIN_VOLUME_DB = -90.0
 MAX_VOLUME_DB = 10.0
 
+# Per-input lip sync delay (SLIP), in milliseconds.
+MIN_LIP_SYNC_MS = 0
+MAX_LIP_SYNC_MS = 150
+LIP_SYNC_STEP_MS = 5
+
+# Per-input Dolby Volume Leveler (SDVL). 0 = off.
+MIN_DOLBY_VOLUME_LEVELER = 0
+MAX_DOLBY_VOLUME_LEVELER = 9
+
 # All command/response prefixes that come from the receiver. Sorted by
 # length descending so longer matches win (e.g. ``Z1IRH`` before ``Z1IR``).
 _RESPONSE_PREFIXES: tuple[str, ...] = (

@@ -23,6 +23,11 @@ class InputConfig:
     short_name: str | None = None
     long_name: str | None = None
 
+    # Per-input processing settings (SLIP / SDVS / SDVL).
+    lip_sync_ms: int | None = None  # 0-150 ms in 5 ms steps
+    dolby_volume: bool | None = None
+    dolby_volume_leveler: int | None = None  # 0 = off, 1-9
+
 
 @dataclass
 class TriggerState:

@@ -471,3 +471,89 @@ async def test_x10_model_skips_unsupported_queries(mock_serial):
     assert b"Z1POW?;" in sent
     assert b"Z1VOL?;" in sent
     await recv.disconnect()
+
+
+# -- Per-input processing (SLIP / SDVS / SDVL) --
+
+
+async def test_set_lip_sync(receiver, mock_serial):
+    await receiver.set_lip_sync(50)
+    assert mock_serial.written_data[-1] == b"SLIP00050;"
+    await receiver.set_lip_sync(150, input_index=3)
+    assert mock_serial.written_data[-1] == b"SLIP03150;"
+
+
+async def test_set_lip_sync_validation(receiver, mock_serial):
+    with pytest.raises(ValueError):
+        await receiver.set_lip_sync(155)
+    with pytest.raises(ValueError):
+        await receiver.set_lip_sync(-5)
+    with pytest.raises(ValueError):
+        await receiver.set_lip_sync(52)  # off the 5 ms grid
+    with pytest.raises(ValueError):
+        await receiver.set_lip_sync(50, input_index=31)
+
+
+async def test_set_dolby_volume(receiver, mock_serial):
+    await receiver.set_dolby_volume(True)
+    assert mock_serial.written_data[-1] == b"SDVS001;"
+    await receiver.set_dolby_volume(False, input_index=2)
+    assert mock_serial.written_data[-1] == b"SDVS020;"
+
+
+async def test_set_dolby_volume_leveler(receiver, mock_serial):
+    await receiver.set_dolby_volume_leveler(5)
+    assert mock_serial.written_data[-1] == b"SDVL005;"
+    await receiver.set_dolby_volume_leveler(9, input_index=2)
+    assert mock_serial.written_data[-1] == b"SDVL029;"
+    with pytest.raises(ValueError):
+        await receiver.set_dolby_volume_leveler(10)
+
+
+async def test_query_per_input_processing(receiver, mock_serial):
+    mock_serial._query_responses["SLIP02"] = ["SLIP02050"]
+    mock_serial._query_responses["SDVS02"] = ["SDVS021"]
+    mock_serial._query_responses["SDVL02"] = ["SDVL024"]
+    assert await receiver.query_lip_sync(input_index=2) == 50
+    assert await receiver.query_dolby_volume(input_index=2) is True
+    assert await receiver.query_dolby_volume_leveler(input_index=2) == 4
+    # Query replies also update per-input state.
+    config = receiver.state.inputs[2]
+    assert config.lip_sync_ms == 50
+    assert config.dolby_volume is True
+    assert config.dolby_volume_leveler == 4
+
+
+async def test_per_input_setting_events(receiver, mock_serial):
+    mock_serial.inject_response("SLIP03100")
+    mock_serial.inject_response("SDVS031")
+    mock_serial.inject_response("SDVL037")
+    await asyncio.sleep(0)
+    config = receiver.state.inputs[3]
+    assert config.lip_sync_ms == 100
+    assert config.dolby_volume is True
+    assert config.dolby_volume_leveler == 7
+
+
+async def test_per_input_setting_event_current_input(receiver, mock_serial):
+    # Input 00 = the currently selected input (input 1 after query_state).
+    assert receiver.state.main_zone.input_index == 1
+    mock_serial.inject_response("SLIP00025")
+    await asyncio.sleep(0)
+    assert receiver.state.inputs[1].lip_sync_ms == 25
+
+
+async def test_per_input_setting_event_notifies_subscribers(receiver, mock_serial):
+    states = []
+    receiver.subscribe(states.append)
+    mock_serial.inject_response("SDVS021")
+    await asyncio.sleep(0)
+    assert states
+    assert states[-1].inputs[2].dolby_volume is True
+
+
+async def test_query_speaker_profile_name(receiver, mock_serial):
+    # Regression: pendings whose prefix extends a table entry (SPNy, SLIPxx)
+    # must still resolve.
+    mock_serial._query_responses["SPN2"] = ["SPN2Movie Night"]
+    assert await receiver.query_speaker_profile_name(2) == "Movie Night"

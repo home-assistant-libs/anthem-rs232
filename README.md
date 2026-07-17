@@ -214,6 +214,27 @@ await receiver.main.arc_off()
 on = await receiver.main.query_arc()
 ```
 
+### Per-input processing
+
+Lip sync delay, Dolby Volume, and the Dolby Volume Leveler are stored per
+input on the receiver. ``input_index=0`` (the default) targets the currently
+selected input.
+
+```python
+await receiver.set_lip_sync(50)                        # SLIP00050 (0-150 ms, 5 ms steps)
+await receiver.set_dolby_volume(True, input_index=2)   # SDVS021
+await receiver.set_dolby_volume_leveler(5)             # SDVL005 (0 = off, 1-9)
+
+ms = await receiver.query_lip_sync()
+on = await receiver.query_dolby_volume()
+level = await receiver.query_dolby_volume_leveler()
+
+# Populated per input from query replies and auto-reports:
+receiver.state.inputs[2].lip_sync_ms
+receiver.state.inputs[2].dolby_volume
+receiver.state.inputs[2].dolby_volume_leveler
+```
+
 ### Balance, channel levels, tone
 
 These are runtime adjustments meant to compensate for source material — for system setup, use the receiver's setup menu and ARC.

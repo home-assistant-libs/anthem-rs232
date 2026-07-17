@@ -12,7 +12,12 @@ import serialx
 from .const import (
     BAUD_RATE,
     COMMAND_TIMEOUT,
+    LIP_SYNC_STEP_MS,
+    MAX_DOLBY_VOLUME_LEVELER,
     MAX_INPUTS,
+    MAX_LIP_SYNC_MS,
+    MIN_DOLBY_VOLUME_LEVELER,
+    MIN_LIP_SYNC_MS,
     TERMINATOR,
     AudioInputChannels,
     AudioInputFormat,
@@ -212,6 +217,46 @@ class AnthemReceiver:
         # Response format SNPyzzzzzzzz -- but the response prefix matches our
         # query prefix SPNy, so the captured ``resp`` is the name suffix.
         return resp
+
+    # -- Per-input processing (input 0 = the currently selected input) --
+
+    async def set_lip_sync(self, ms: int, input_index: int = 0) -> None:
+        """Set the lip sync delay in ms (0-150, 5 ms steps) for an input."""
+        _validate_input_index(input_index)
+        if not MIN_LIP_SYNC_MS <= ms <= MAX_LIP_SYNC_MS:
+            raise ValueError(f"Lip sync out of range: {ms}")
+        if ms % LIP_SYNC_STEP_MS:
+            raise ValueError(f"Lip sync must be in {LIP_SYNC_STEP_MS} ms steps: {ms}")
+        await self._send_command("SLIP", f"{input_index:02d}{ms:03d}")
+
+    async def query_lip_sync(self, input_index: int = 0) -> int:
+        """Query the lip sync delay in ms for an input."""
+        _validate_input_index(input_index)
+        return int(await self._query(f"SLIP{input_index:02d}"))
+
+    async def set_dolby_volume(self, enabled: bool, input_index: int = 0) -> None:
+        """Turn Dolby Volume off/on for an input."""
+        _validate_input_index(input_index)
+        await self._send_command(
+            "SDVS", f"{input_index:02d}{'1' if enabled else '0'}"
+        )
+
+    async def query_dolby_volume(self, input_index: int = 0) -> bool:
+        """Query whether Dolby Volume is on for an input."""
+        _validate_input_index(input_index)
+        return await self._query(f"SDVS{input_index:02d}") == "1"
+
+    async def set_dolby_volume_leveler(self, level: int, input_index: int = 0) -> None:
+        """Set the Dolby Volume Leveler (0 = off, 1-9) for an input."""
+        _validate_input_index(input_index)
+        if not MIN_DOLBY_VOLUME_LEVELER <= level <= MAX_DOLBY_VOLUME_LEVELER:
+            raise ValueError(f"Dolby Volume Leveler out of range: {level}")
+        await self._send_command("SDVL", f"{input_index:02d}{level}")
+
+    async def query_dolby_volume_leveler(self, input_index: int = 0) -> int:
+        """Query the Dolby Volume Leveler (0 = off, 1-9) for an input."""
+        _validate_input_index(input_index)
+        return int(await self._query(f"SDVL{input_index:02d}"))
 
     # -- Triggers --
 
@@ -486,9 +531,13 @@ class AnthemReceiver:
         param = message[len(prefix) :]
         changed = self._apply_event(prefix, param)
 
+        # Match pendings by startswith, not equality with the table prefix:
+        # query prefixes may extend a table entry with an index or channel
+        # (SPN1, Z1LEV3, SLIP02), and each pending gets the payload after its
+        # own prefix.
         for pending in list(self._pending_queries):
-            if pending.prefix == prefix and not pending.future.done():
-                pending.future.set_result(param)
+            if message.startswith(pending.prefix) and not pending.future.done():
+                pending.future.set_result(message[len(pending.prefix) :])
 
         if changed:
             self._notify_subscribers()
@@ -690,6 +739,10 @@ class AnthemReceiver:
             except ValueError:
                 return False
 
+        # Per-input processing settings
+        if prefix in ("SLIP", "SDVS", "SDVL"):
+            return self._update_input_setting(prefix, param)
+
         # Triggers
         if prefix in ("R0CTL", "R1CTL", "R0SET", "R1SET"):
             return self._update_trigger(prefix, param)
@@ -713,6 +766,37 @@ class AnthemReceiver:
         if getattr(config, attr) == name:
             return False
         setattr(config, attr, name)
+        return True
+
+    def _update_input_setting(self, prefix: str, param: str) -> bool:
+        """Handle SLIPxxyyy / SDVSxxy / SDVLxxy per-input setting events."""
+        if len(param) < 3:
+            return False
+        try:
+            idx = int(param[:2])
+        except ValueError:
+            return False
+        if idx == 0:
+            # 00 = the currently selected input.
+            current = self._state.main_zone.input_index
+            if current is None:
+                return False
+            idx = current
+        value = param[2:]
+        config = self._state.inputs.get(idx)
+        if config is None:
+            config = InputConfig(index=idx)
+            self._state.inputs[idx] = config
+        new_value: object
+        if prefix == "SLIP":
+            attr, new_value = "lip_sync_ms", _safe_int(value)
+        elif prefix == "SDVS":
+            attr, new_value = "dolby_volume", value == "1"
+        else:  # SDVL
+            attr, new_value = "dolby_volume_leveler", _safe_int(value)
+        if new_value is None or getattr(config, attr) == new_value:
+            return False
+        setattr(config, attr, new_value)
         return True
 
     def _update_power(self, prefix: str, param: str) -> bool:
@@ -753,6 +837,11 @@ class AnthemReceiver:
                 callback(snapshot)
             except Exception:
                 _LOGGER.exception("Error in state change callback %s", callback)
+
+
+def _validate_input_index(input_index: int) -> None:
+    if not 0 <= input_index <= MAX_INPUTS:
+        raise ValueError(f"Input index out of range: {input_index}")
 
 
 def _safe_int(value: str) -> int | None:

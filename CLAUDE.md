@@ -68,6 +68,7 @@ tests/
 - Prefix matching is longest-first (`_PREFIXES_BY_LEN`).
 - `Z0POW` events update both zones + a synthesized aggregate `state.power` ("any zone on" → True; "all zones off" → False).
 - Volume is integer dB only (per spec: "Entry is rounded to nearest valid value"). Format is `±NN` (e.g. `Z1VOL-35`, `Z1VOL+05`).
+- Per-input settings (`SLIP` lip sync, `SDVS`/`SDVL` Dolby Volume) live on `InputConfig`; an event/report for input `00` is applied to the currently selected input. Pending queries are matched by `startswith`, so indexed query prefixes (`SPN1`, `SLIP02`, `Z1LEV3`) resolve even though the response-prefix table only holds the base command.
 
 ### Gen 1
 
@@ -82,7 +83,7 @@ tests/
 - `pytest` with `pytest-asyncio`, `asyncio_mode = "auto"`.
 - Gen 2: `MockSerialConnection` in `conftest.py` -- real `asyncio.StreamReader`, mock writer; `_on_write` auto-responds to `?`-suffixed queries from `_query_responses`.
 - Gen 1: `MockGen1Serial` in `test_gen1.py` -- same pattern, but matches against full command bytes (because Gen 1 has no universal "?" suffix), splits chained `;` commands before matching.
-- 142 tests total: 68 Gen 2, 74 Gen 1.
+- 161 tests total: 87 Gen 2, 74 Gen 1.
 - Run: `uv run pytest` or `python -m pytest tests/`
 
 ## Protocol references
