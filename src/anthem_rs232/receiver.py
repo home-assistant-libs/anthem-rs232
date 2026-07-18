@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
@@ -12,6 +13,8 @@ import serialx
 from .const import (
     BAUD_RATE,
     COMMAND_TIMEOUT,
+    WATCHDOG_INTERVAL,
+    WATCHDOG_PROBE_ATTEMPTS,
     LIP_SYNC_STEP_MS,
     MAX_DOLBY_VOLUME_LEVELER,
     MAX_INPUTS,
@@ -77,6 +80,8 @@ class AnthemReceiver:
         self._reader: asyncio.StreamReader | None = None
         self._writer: serialx.SerialStreamWriter | None = None
         self._read_task: asyncio.Task | None = None
+        self._watchdog_task: asyncio.Task | None = None
+        self._last_rx = 0.0
         self._state = ReceiverState()
         self.main = MainPlayer(self, self._state.main_zone)
         self.zone_2 = ZonePlayer(self, Zone.ZONE_2, self._state.zone_2)
@@ -123,6 +128,9 @@ class AnthemReceiver:
         )
         self._connected = True
         self._read_task = asyncio.create_task(self._read_loop())
+        self._read_task.add_done_callback(self._on_read_task_done)
+        self._last_rx = time.monotonic()
+        self._watchdog_task = asyncio.create_task(self._watchdog_loop())
 
         # Use Z1POW? for the verification probe -- the spec lists it (along
         # with IDM? and ZxPOWy) as one of the few commands that work even
@@ -456,6 +464,14 @@ class AnthemReceiver:
                 pass
         self._read_task = None
 
+        if self._watchdog_task is not None and self._watchdog_task is not current:
+            self._watchdog_task.cancel()
+            try:
+                await self._watchdog_task
+            except asyncio.CancelledError:
+                pass
+        self._watchdog_task = None
+
         if self._writer is not None:
             self._writer.close()
             await self._writer.wait_closed()
@@ -490,14 +506,72 @@ class AnthemReceiver:
                 await self._teardown()
                 return
 
+            self._last_rx = time.monotonic()
             buf += data
             while TERMINATOR in buf:
                 line, buf = buf.split(TERMINATOR, 1)
                 if not line:
                     continue
                 message = line.decode("ascii", errors="replace").strip()
-                if message:
+                if not message:
+                    continue
+                # One malformed frame must never kill the read loop: a dead
+                # loop leaves a connected, subscribed session nobody drains.
+                try:
                     self._process_message(message)
+                except Exception:
+                    _LOGGER.exception("Error processing message %r; skipping", message)
+
+    def _on_read_task_done(self, task: asyncio.Task) -> None:
+        """Tear down if the read loop ends while still connected.
+
+        The loop should only end via teardown; anything else (an escaped
+        exception, a stray cancellation) would otherwise leave a live,
+        subscribed session whose data is never read.
+        """
+        if not self._connected:
+            return
+        exc = None if task.cancelled() else task.exception()
+        _LOGGER.warning(
+            "Read loop ended unexpectedly (%r); tearing down connection", exc
+        )
+        asyncio.get_running_loop().create_task(self._teardown())
+
+    async def _watchdog_loop(self) -> None:
+        """Probe the link when RX has been idle; tear down if it's dead.
+
+        Some transports (serial-over-network proxies) can die without
+        delivering EOF or an exception, leaving an idle-but-dead session.
+        Z1POW? is answered even in standby, so an unanswered probe means
+        the link is gone; teardown lets the owner reconnect.
+        """
+        while self._connected:
+            await asyncio.sleep(WATCHDOG_INTERVAL)
+            if not self._connected:
+                return
+            if time.monotonic() - self._last_rx < WATCHDOG_INTERVAL:
+                continue
+            _LOGGER.debug(
+                "No RX for %.0f s; probing link with Z1POW?", WATCHDOG_INTERVAL
+            )
+            # A unit in ECO standby consumes the first frame as wake-up, so
+            # retry before declaring the link dead. An error reply counts as
+            # alive: any response proves the transport works.
+            for _ in range(WATCHDOG_PROBE_ATTEMPTS):
+                try:
+                    await self._query("Z1POW")
+                    break
+                except CommandError:
+                    break
+                except (TimeoutError, ConnectionError, OSError):
+                    if not self._connected:
+                        return
+            else:
+                _LOGGER.warning(
+                    "Watchdog probes got no response; tearing down connection"
+                )
+                await self._teardown()
+                return
 
     # -- Message processing --
 

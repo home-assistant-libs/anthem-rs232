@@ -296,6 +296,7 @@ await receiver.set_trigger(1, on=True)
 
 - If `IDM?` is not answered during `connect()`, `ConnectionError` is raised.
 - If the serial connection drops, subscribers receive `None` and `connected` becomes `False`.
+- An idle watchdog probes the link (`Z1POW?`, answered even in standby) after 60 s without RX and tears the connection down if repeated probes go unanswered — covering transports (e.g. serial-over-network proxies) that can die without delivering EOF. The probe retries up to 3 times because a unit in ECO standby consumes the first frame as its wake-up.
 - Receiver errors come back as `!E/R/I/Z<original>;` and raise `CommandError` from the matching pending query. Fire-and-forget commands log the error.
 
 ```python

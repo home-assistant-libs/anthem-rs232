@@ -13,6 +13,10 @@ from enum import Enum
 # the D2/D2v ship at ``19200``. Per-model overrides live on the ReceiverModel.
 DEFAULT_BAUD_RATE = 9600
 COMMAND_TIMEOUT = 2.0
+WATCHDOG_INTERVAL = 60.0  # seconds without RX before probing the link
+# Sleeping units can consume the first frame as wake-up; retry before
+# declaring the link dead.
+WATCHDOG_PROBE_ATTEMPTS = 3
 DELAY_AFTER_POWER_ON = 12.0  # seconds before the unit accepts further commands
 MIN_TIME_BETWEEN_COMMANDS = 0.250  # 250 ms throttle
 MAX_LINE_LENGTH = 64  # bytes including the LF
