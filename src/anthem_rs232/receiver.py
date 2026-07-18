@@ -507,6 +507,13 @@ class AnthemReceiver:
                 return
 
             self._last_rx = time.monotonic()
+            # Receivers emit stray NUL bytes around standby transitions
+            # (~1 s after each response while dozing). The protocol is
+            # pure ASCII; a NUL left in the buffer glues onto the next
+            # frame and breaks prefix matching, so drop them.
+            data = data.replace(b"\x00", b"")
+            if not data:
+                continue
             buf += data
             while TERMINATOR in buf:
                 line, buf = buf.split(TERMINATOR, 1)

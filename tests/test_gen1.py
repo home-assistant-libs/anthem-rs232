@@ -636,3 +636,13 @@ async def test_gen1_watchdog_tears_down_dead_link(gen1, mock_serial_gen1):
         assert states[-1] is None
     finally:
         gen1_receiver_mod.WATCHDOG_INTERVAL = 60.0
+
+
+# -- Standby NUL noise --
+
+
+async def test_gen1_stray_nul_does_not_corrupt_next_frame(gen1, mock_serial_gen1):
+    mock_serial_gen1.reader.feed_data(b"\x00")
+    mock_serial_gen1.feed(b"P1VM-27.5")
+    await asyncio.sleep(0)
+    assert gen1.state.main_zone.volume == -27.5
