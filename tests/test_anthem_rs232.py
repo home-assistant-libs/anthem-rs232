@@ -654,3 +654,29 @@ async def test_watchdog_survives_eco_standby_wakeup(mock_serial):
         await recv.disconnect()
     finally:
         anthem_receiver.WATCHDOG_INTERVAL = 60.0
+
+
+# -- Standby NUL noise --
+
+
+async def test_stray_nul_does_not_corrupt_next_frame(receiver, mock_serial):
+    """ECO standby emits a stray NUL ~1 s after responses; it must not glue
+    onto the next frame and break prefix matching."""
+    mock_serial.reader.feed_data(b"\x00")
+    mock_serial.inject_response("Z1VOL-27")
+    await asyncio.sleep(0)
+    assert receiver.state.main_zone.volume == -27.0
+
+
+async def test_query_resolves_despite_stale_nul(receiver, mock_serial):
+    """Wire-observed failure: pending Z1POW? timed out even though the
+    receiver answered, because a stale NUL prefixed the reply."""
+    mock_serial.reader.feed_data(b"\x00")
+    mock_serial._query_responses["Z1POW"] = ["Z1POW0"]
+    assert await receiver.main.query_power() is False
+
+
+async def test_nul_inside_chunk_is_stripped(receiver, mock_serial):
+    mock_serial.reader.feed_data(b"\x00Z1VOL-28;\x00")
+    await asyncio.sleep(0)
+    assert receiver.state.main_zone.volume == -28.0
