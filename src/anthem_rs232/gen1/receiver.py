@@ -13,6 +13,7 @@ import serialx
 from .const import (
     COMMAND_TIMEOUT,
     WATCHDOG_INTERVAL,
+    WATCHDOG_PROBE_ATTEMPTS,
     HEADPHONE_VOLUME_STEP,
     MAIN_VOLUME_STEP,
     MAX_AM_FREQUENCY,
@@ -412,13 +413,21 @@ class Gen1Receiver:
             _LOGGER.debug(
                 "No RX for %.0f s; probing link with identify", WATCHDOG_INTERVAL
             )
-            try:
-                await self.identify()
-            except (TimeoutError, Gen1CommandError, ConnectionError, OSError):
-                if not self._connected:
-                    return
+            # A sleeping unit can consume the first frame as wake-up, so
+            # retry before declaring the link dead. An error reply counts
+            # as alive: any response proves the transport works.
+            for _ in range(WATCHDOG_PROBE_ATTEMPTS):
+                try:
+                    await self.identify()
+                    break
+                except Gen1CommandError:
+                    break
+                except (TimeoutError, ConnectionError, OSError):
+                    if not self._connected:
+                        return
+            else:
                 _LOGGER.warning(
-                    "Watchdog probe got no response; tearing down connection"
+                    "Watchdog probes got no response; tearing down connection"
                 )
                 await self._teardown()
                 return

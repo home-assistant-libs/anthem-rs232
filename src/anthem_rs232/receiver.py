@@ -14,6 +14,7 @@ from .const import (
     BAUD_RATE,
     COMMAND_TIMEOUT,
     WATCHDOG_INTERVAL,
+    WATCHDOG_PROBE_ATTEMPTS,
     LIP_SYNC_STEP_MS,
     MAX_DOLBY_VOLUME_LEVELER,
     MAX_INPUTS,
@@ -553,13 +554,21 @@ class AnthemReceiver:
             _LOGGER.debug(
                 "No RX for %.0f s; probing link with Z1POW?", WATCHDOG_INTERVAL
             )
-            try:
-                await self._query("Z1POW")
-            except (TimeoutError, CommandError, ConnectionError, OSError):
-                if not self._connected:
-                    return
+            # A unit in ECO standby consumes the first frame as wake-up, so
+            # retry before declaring the link dead. An error reply counts as
+            # alive: any response proves the transport works.
+            for _ in range(WATCHDOG_PROBE_ATTEMPTS):
+                try:
+                    await self._query("Z1POW")
+                    break
+                except CommandError:
+                    break
+                except (TimeoutError, ConnectionError, OSError):
+                    if not self._connected:
+                        return
+            else:
                 _LOGGER.warning(
-                    "Watchdog probe got no response; tearing down connection"
+                    "Watchdog probes got no response; tearing down connection"
                 )
                 await self._teardown()
                 return

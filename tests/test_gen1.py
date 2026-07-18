@@ -630,7 +630,8 @@ async def test_gen1_watchdog_tears_down_dead_link(gen1, mock_serial_gen1):
         gen1.subscribe(states.append)
         # Kill the identify auto-responder: the link is now silently dead.
         mock_serial_gen1._handlers.clear()
-        await asyncio.sleep(0.4)
+        # idle > interval -> 3 probes, each timing out -> teardown
+        await asyncio.sleep(0.7)
         assert gen1.connected is False
         assert states[-1] is None
     finally:

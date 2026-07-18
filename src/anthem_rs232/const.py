@@ -6,6 +6,9 @@ from enum import Enum
 BAUD_RATE = 115200
 COMMAND_TIMEOUT = 2.0  # seconds to wait for a response
 WATCHDOG_INTERVAL = 60.0  # seconds without RX before probing the link
+# ECO standby consumes the first frame as MCU wake-up (spec notes 10/11),
+# so probe several times before declaring the link dead.
+WATCHDOG_PROBE_ATTEMPTS = 3
 PROBE_TIMEOUT = 0.8  # seconds to wait for each probe attempt
 TERMINATOR = b";"
 

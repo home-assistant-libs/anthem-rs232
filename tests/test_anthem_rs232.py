@@ -600,7 +600,8 @@ async def test_watchdog_tears_down_dead_link(mock_serial):
         recv.subscribe(states.append)
         # Kill the auto-responder: the link is now silently dead.
         mock_serial._query_responses.clear()
-        await asyncio.sleep(0.4)  # idle > interval -> probe -> timeout
+        # idle > interval -> 3 probes, each timing out -> teardown
+        await asyncio.sleep(0.7)
         assert recv.connected is False
         assert states[-1] is None
         assert b"Z1POW?;" in mock_serial.written_data[-1:] or any(
@@ -621,6 +622,35 @@ async def test_watchdog_quiet_while_traffic_flows(mock_serial):
             await asyncio.sleep(0.02)
         assert recv.connected
         assert b"Z1POW?;" not in mock_serial.written_data
+        await recv.disconnect()
+    finally:
+        anthem_receiver.WATCHDOG_INTERVAL = 60.0
+
+
+async def test_watchdog_survives_eco_standby_wakeup(mock_serial):
+    """ECO standby eats the first probe as MCU wake-up; retry must save it."""
+
+    class EatsFirstProbe(dict):
+        def __init__(self, *args):
+            super().__init__(*args)
+            self.eaten = False
+
+        def get(self, key, default=None):
+            if key == "Z1POW" and not self.eaten:
+                self.eaten = True
+                return []
+            return super().get(key, default)
+
+    anthem_receiver.WATCHDOG_INTERVAL = 0.06
+    try:
+        recv = await connect_with_defaults(mock_serial)
+        mock_serial._query_responses = EatsFirstProbe({"Z1POW": ["Z1POW0"]})
+        mock_serial.written_data.clear()
+        # idle -> first probe eaten (timeout), second answered -> stays up
+        await asyncio.sleep(0.4)
+        assert recv.connected
+        probes = [w for w in mock_serial.written_data if w == b"Z1POW?;"]
+        assert len(probes) >= 2
         await recv.disconnect()
     finally:
         anthem_receiver.WATCHDOG_INTERVAL = 60.0
