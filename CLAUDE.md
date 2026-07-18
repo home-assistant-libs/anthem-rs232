@@ -46,7 +46,7 @@ tests/
 - Errors: `!E<orig>` (cannot execute), `!R<orig>` (out of range), `!I<orig>` (invalid command), `!Z<orig>` (zone off, system not in standby).
 - `connect()` opens the port, verifies with `Z1POW?` (3-attempt retry for flaky proxies), then sends `ECH1;` to enable auto-reports.
 - `query_state()` queries identification, inputs (`ICN?` + per-input `ISNyy?`/`ILNyy?`), and per-zone state.
-- Background `_read_loop` parses `;`-terminated events; `state` returns a deep copy of `ReceiverState`.
+- Background `_read_loop` parses `;`-terminated events; `state` returns a deep copy of `ReceiverState`. Per-message processing is exception-hardened (a malformed frame is logged and skipped, never kills the loop), the read task has a done-callback that tears down the connection if the loop ends while still connected, and an idle watchdog probes the link (`Z1POW?` Gen 2 / `?` identify Gen 1 -- both answered in standby) after `WATCHDOG_INTERVAL` (60 s) without RX, tearing down on no response so the owner can reconnect. This covers transports (serial-over-network proxies) that die without delivering EOF or an exception.
 - Subscribers receive `ReceiverState` on changes, `None` on disconnect.
 
 ### Gen 1
@@ -83,7 +83,7 @@ tests/
 - `pytest` with `pytest-asyncio`, `asyncio_mode = "auto"`.
 - Gen 2: `MockSerialConnection` in `conftest.py` -- real `asyncio.StreamReader`, mock writer; `_on_write` auto-responds to `?`-suffixed queries from `_query_responses`.
 - Gen 1: `MockGen1Serial` in `test_gen1.py` -- same pattern, but matches against full command bytes (because Gen 1 has no universal "?" suffix), splits chained `;` commands before matching.
-- 161 tests total: 87 Gen 2, 74 Gen 1.
+- 168 tests total: 91 Gen 2, 77 Gen 1.
 - Run: `uv run pytest` or `python -m pytest tests/`
 
 ## Protocol references

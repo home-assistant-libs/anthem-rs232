@@ -5,6 +5,7 @@ from enum import Enum
 # Anthem MRX x20 / AVM 60 serial defaults: 115200 8N1, semicolon terminator.
 BAUD_RATE = 115200
 COMMAND_TIMEOUT = 2.0  # seconds to wait for a response
+WATCHDOG_INTERVAL = 60.0  # seconds without RX before probing the link
 PROBE_TIMEOUT = 0.8  # seconds to wait for each probe attempt
 TERMINATOR = b";"
 

@@ -587,3 +587,51 @@ def test_mrx_700_model_defaults():
     assert MRX_700.baud_rate == 9600
     assert MRX_700.zones == 2
     assert MRX_700.has_headphone is False
+
+
+# -- Read-loop resilience --
+
+
+async def test_gen1_malformed_frame_does_not_kill_read_loop(gen1, mock_serial_gen1):
+    calls = []
+    orig = gen1._apply_event
+
+    def boom(message):
+        if not calls:
+            calls.append(1)
+            raise ValueError("boom")
+        return orig(message)
+
+    gen1._apply_event = boom
+    mock_serial_gen1.feed(b"P1VM-20.0")  # raises inside processing
+    mock_serial_gen1.feed(b"P1VM-30.0")  # must still be processed
+    await asyncio.sleep(0)
+    assert gen1.connected
+    assert not gen1._read_task.done()
+    assert gen1.state.main_zone.volume == -30.0
+
+
+async def test_gen1_read_task_death_triggers_teardown(gen1, mock_serial_gen1):
+    states = []
+    gen1.subscribe(states.append)
+    gen1._read_task.cancel()
+    await asyncio.sleep(0.05)
+    assert gen1.connected is False
+    assert states[-1] is None
+
+
+async def test_gen1_watchdog_tears_down_dead_link(gen1, mock_serial_gen1):
+    gen1_receiver_mod.WATCHDOG_INTERVAL = 0.06
+    try:
+        # Restart the watchdog with the short interval.
+        gen1._watchdog_task.cancel()
+        gen1._watchdog_task = asyncio.create_task(gen1._watchdog_loop())
+        states = []
+        gen1.subscribe(states.append)
+        # Kill the identify auto-responder: the link is now silently dead.
+        mock_serial_gen1._handlers.clear()
+        await asyncio.sleep(0.4)
+        assert gen1.connected is False
+        assert states[-1] is None
+    finally:
+        gen1_receiver_mod.WATCHDOG_INTERVAL = 60.0
