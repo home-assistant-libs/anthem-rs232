@@ -90,3 +90,11 @@ tests/
 
 - Gen 2: [Anthem MRX 1120 / 720 / 520 / AVM 60 IP / RS-232 serial commands](https://docs.google.com/spreadsheets/d/1_lN8JWSIPRrWrqxuZ3lNGy5GQ3FjyaBi6kIeuk21GP4/edit?usp=sharing) (Feb 2 2016).
 - Gen 1: AVM-2 serial spec (21 Nov 2000) bundled in `rsnodgrass/python-anthemav-serial/docs/AVM-2-serial-programming.txt`. YAML command tables: `anthemav_serial/protocols/anthem_rs232_gen1.yaml`.
+
+## AI policy
+
+This project follows the [Open Home Foundation AI Policy](AI_POLICY.md).
+Autonomous contributions are not accepted: a human must review, understand,
+and be able to explain every change before it is submitted. Do not open
+issues or pull requests autonomously, and do not post comments on behalf of
+a user without their review.
