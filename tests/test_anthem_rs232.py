@@ -617,6 +617,9 @@ async def test_watchdog_probes_z1pow_when_idle(mock_serial):
         side_effect=fake_open,
     ):
         await recv.connect()
+        # Ignore the connect-time Z1POW? verify; from here only the idle
+        # watchdog should write, so the assertion validates the watchdog.
+        mock_serial.written_data.clear()
         await asyncio.sleep(0.2)  # several idle windows
         assert recv.connected  # answered probes -> never declared dead
         assert any(w == b"Z1POW?;" for w in mock_serial.written_data)

@@ -646,6 +646,9 @@ async def test_gen1_watchdog_probes_identify_when_idle(mock_serial_gen1):
         side_effect=fake_open,
     ):
         await recv.connect()
+        # Ignore the connect-time identify verify; from here only the idle
+        # watchdog should write, so the assertion validates the watchdog.
+        mock_serial_gen1.written.clear()
         await asyncio.sleep(0.2)  # several idle windows
         assert recv.connected  # answered probes -> never declared dead
         assert any(w == b"?\n" for w in mock_serial_gen1.written)
