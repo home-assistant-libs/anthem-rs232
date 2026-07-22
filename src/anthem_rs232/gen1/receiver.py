@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
-import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, TypeAlias
 
 import serialx
+from serialkit import (
+    CommandTimeoutError,
+    DelimiterFramer,
+    ProbeSpec,
+    ProtocolError,
+    SerialDevice,
+)
 
 from .const import (
     COMMAND_TIMEOUT,
@@ -33,7 +38,6 @@ from .const import (
     Zone,
 )
 from .protocol import (
-    PendingQuery,
     db_to_param,
     match_error,
     parse_am_frequency,
@@ -52,7 +56,6 @@ from .protocol import (
     parse_version,
     parse_volume,
     parse_zone2_status,
-    split_lines,
 )
 from .state import (
     Gen1ReceiverState,
@@ -71,7 +74,7 @@ _LOGGER = logging.getLogger(__name__)
 StateCallback: TypeAlias = Callable[[Gen1ReceiverState | None], None]
 
 
-class Gen1CommandError(Exception):
+class Gen1CommandError(ProtocolError):
     """The receiver responded with one of the verbose Gen 1 error strings."""
 
     def __init__(self, phrase: str) -> None:
@@ -79,13 +82,28 @@ class Gen1CommandError(Exception):
         self.phrase = phrase
 
 
-class Gen1Receiver:
+class Gen1Receiver(SerialDevice[Gen1ReceiverState]):
     """Async controller for an Anthem Gen 1 receiver over RS232.
 
     Supports Statement D1/D2/D2v, AVM 20/30/40/50/50v, and MRX 300/500/700.
     Pass a ``Gen1ReceiverModel`` so the receiver knows the correct baud rate
     and source map; defaults to a generic 9600-baud configuration.
+
+    Built on serialkit: framing (``\\n`` terminator with inline ``;`` split,
+    NUL scrub), matcher-based query correlation, the read loop, an idle-window
+    watchdog, and reconnect are provided by :class:`serialkit.SerialDevice`.
     """
+
+    framer_factory = staticmethod(lambda: DelimiterFramer(TERMINATOR, strip=b"\x00"))
+    request_timeout = COMMAND_TIMEOUT
+    # The ``?`` identify query is answered in any power state; any RX (incl. an
+    # error reply) counts as alive. attempts covers a sleeping unit eating the
+    # first frame as MCU wake-up.
+    probe = ProbeSpec(
+        frame=b"?" + TERMINATOR,
+        idle=WATCHDOG_INTERVAL,
+        attempts=WATCHDOG_PROBE_ATTEMPTS,
+    )
 
     def __init__(
         self,
@@ -102,23 +120,21 @@ class Gen1Receiver:
             self._baud_rate = model.baud_rate
         else:
             self._baud_rate = 9600
-
-        self._reader: asyncio.StreamReader | None = None
-        self._writer: serialx.SerialStreamWriter | None = None
-        self._read_task: asyncio.Task | None = None
-        self._watchdog_task: asyncio.Task | None = None
-        self._last_rx = 0.0
-        self._state = Gen1ReceiverState()
-        self._subscribers: list[StateCallback] = []
-        self._pending_queries: list[PendingQuery] = []
-        self._write_lock = asyncio.Lock()
-        self._connected = False
+        super().__init__(self._open_connection)
+        # A state object before start() so player/property reads work
+        # pre-connect; serialkit rebuilds it via make_state() per connection.
+        self.state = self.make_state()
 
         self.main = MainPlayer(self)
         self.zone_2 = Zone2Player(self)
         self.rec = RecPlayer(self)
         self.headphone = Headphone(self)
         self.tuner = Tuner(self)
+
+    async def _open_connection(self) -> tuple[object, object]:
+        return await serialx.open_serial_connection(
+            self._port, baudrate=self._baud_rate
+        )
 
     # -- Properties -------------------------------------------------------
 
@@ -130,43 +146,35 @@ class Gen1Receiver:
     def baud_rate(self) -> int:
         return self._baud_rate
 
-    @property
-    def state(self) -> Gen1ReceiverState:
-        """Return a deep copy of the current state."""
-        return self._state.copy()
+    # -- serialkit lifecycle callbacks -----------------------------------
+
+    def make_state(self) -> Gen1ReceiverState:
+        return Gen1ReceiverState()
+
+    def copy_state(self, state: Gen1ReceiverState) -> Gen1ReceiverState:
+        return state.copy()
 
     @property
-    def connected(self) -> bool:
-        return self._connected
+    def _state(self) -> Gen1ReceiverState:
+        """The live receiver state.
 
-    # -- Subscriptions ---------------------------------------------------
+        Read-through so the dispatcher and the zone players always see the
+        current connection's state object (serialkit rebuilds it on reconnect).
+        """
+        assert self.state is not None
+        return self.state
 
-    def subscribe(self, callback: StateCallback) -> Callable[[], None]:
-        self._subscribers.append(callback)
-        return lambda: self._subscribers.remove(callback)
+    async def on_connect(self) -> None:
+        """Identify the unit, then enable Tx Status auto-reports (SST1).
 
-    # -- Lifecycle -------------------------------------------------------
-
-    async def connect(self) -> None:
-        """Open the serial port, identify the unit, enable Tx Status reports."""
-        self._reader, self._writer = await serialx.open_serial_connection(
-            self._port,
-            baudrate=self._baud_rate,
-        )
-        self._connected = True
-        self._read_task = asyncio.create_task(self._read_loop())
-        self._read_task.add_done_callback(self._on_read_task_done)
-        self._last_rx = time.monotonic()
-        self._watchdog_task = asyncio.create_task(self._watchdog_loop())
-
+        Runs on every (re)connection with frames already flowing.
+        """
         try:
             await self.identify()
-        except (TimeoutError, Gen1CommandError):
-            await self.disconnect()
+        except (CommandTimeoutError, Gen1CommandError):
             raise ConnectionError(
                 f"No response from receiver on {self._port}"
             ) from None
-
         # Enable Tx Status so external state changes (front panel / IR / knob)
         # propagate as auto-report frames in the same format as our queries.
         try:
@@ -174,10 +182,36 @@ class Gen1Receiver:
         except Gen1CommandError:
             _LOGGER.debug("SST1 rejected; continuing without auto-reports")
 
+    def on_frame(self, frame: bytes) -> None:
+        """Route one framed line, splitting inline ``;``-chained messages.
+
+        Order: error -> reject the oldest pending; else apply state -> resolve
+        the first pending whose matcher accepts the frame.
+        """
+        for part in frame.split(b";"):
+            message = part.decode("ascii", errors="replace").strip()
+            if not message:
+                continue
+            err = match_error(message)
+            if err is not None:
+                # Gen 1 errors carry no correlating content; reject the oldest
+                # in-flight query (or log if none is pending).
+                if not self.pending.reject_oldest(Gen1CommandError(err)):
+                    _LOGGER.warning("Unsolicited error from receiver: %s", err)
+                continue
+            if self._apply_event(message):
+                self.notify()
+            self.pending.feed(part)
+
+    # -- Lifecycle (aliases over serialkit start/stop) -------------------
+
+    async def connect(self) -> None:
+        """Open the serial port, identify, and enable Tx Status reports."""
+        await self.start()
         _LOGGER.info("Connected to Anthem Gen 1 receiver on %s", self._port)
 
     async def disconnect(self) -> None:
-        await self._teardown()
+        await self.stop()
         _LOGGER.info("Disconnected from Anthem Gen 1 receiver")
 
     # -- Identify --------------------------------------------------------
@@ -285,17 +319,7 @@ class Gen1Receiver:
 
     async def _send(self, command: bytes) -> None:
         """Write a raw command to the wire (the LF terminator is appended)."""
-        assert self._writer is not None
-        msg = command + TERMINATOR
-        _LOGGER.debug("Sending: %s", msg)
-        try:
-            async with self._write_lock:
-                self._writer.write(msg)
-                await self._writer.drain()
-        except Exception:
-            _LOGGER.exception("Error writing to serial port")
-            await self._teardown()
-            raise
+        await self.send(command + TERMINATOR)
 
     async def _query(
         self,
@@ -304,140 +328,25 @@ class Gen1Receiver:
         *,
         timeout: float | None = None,
     ) -> Any:
-        """Send a query and wait for a frame the ``matcher`` callable accepts."""
-        if timeout is None:
-            timeout = COMMAND_TIMEOUT
-        loop = asyncio.get_running_loop()
-        future: asyncio.Future = loop.create_future()
-        pending = PendingQuery(matcher=matcher, future=future)
-        self._pending_queries.append(pending)
-        try:
-            await self._send(command)
-            return await asyncio.wait_for(future, timeout=timeout)
-        finally:
-            if pending in self._pending_queries:
-                self._pending_queries.remove(pending)
+        """Send a query and wait for a frame the ``matcher`` callable accepts.
 
-    # -- Read loop -------------------------------------------------------
-
-    async def _teardown(self) -> None:
-        if not self._connected:
-            return
-        self._connected = False
-
-        current = asyncio.current_task()
-        if self._read_task is not None and self._read_task is not current:
-            self._read_task.cancel()
-            try:
-                await self._read_task
-            except asyncio.CancelledError:
-                pass
-        self._read_task = None
-
-        if self._watchdog_task is not None and self._watchdog_task is not current:
-            self._watchdog_task.cancel()
-            try:
-                await self._watchdog_task
-            except asyncio.CancelledError:
-                pass
-        self._watchdog_task = None
-
-        if self._writer is not None:
-            self._writer.close()
-            await self._writer.wait_closed()
-            self._writer = None
-            self._reader = None
-
-        for pending in self._pending_queries:
-            if not pending.future.done():
-                pending.future.set_exception(TimeoutError("Connection lost"))
-        self._pending_queries.clear()
-        self._notify_subscribers()
-
-    async def _read_loop(self) -> None:
-        assert self._reader is not None
-        buf = b""
-        while self._connected:
-            try:
-                data = await self._reader.read(256)
-            except Exception:
-                if not self._connected:
-                    return
-                _LOGGER.exception("Error reading from serial port")
-                await self._teardown()
-                return
-
-            if not data:
-                _LOGGER.warning("Serial connection closed")
-                await self._teardown()
-                return
-
-            self._last_rx = time.monotonic()
-            # Receivers emit stray NUL bytes around standby transitions
-            # (~1 s after each response while dozing). The protocol is
-            # pure ASCII; a NUL left in the buffer glues onto the next
-            # frame and breaks prefix matching, so drop them.
-            data = data.replace(b"\x00", b"")
-            if not data:
-                continue
-            buf += data
-            messages, buf = split_lines(buf)
-            for raw in messages:
-                line = raw.decode("ascii", errors="replace").strip()
-                if not line:
-                    continue
-                # One malformed frame must never kill the read loop: a dead
-                # loop leaves a connected session nobody drains.
-                try:
-                    self._process_message(line)
-                except Exception:
-                    _LOGGER.exception("Error processing message %r; skipping", line)
-
-    def _on_read_task_done(self, task: asyncio.Task) -> None:
-        """Tear down if the read loop ends while still connected."""
-        if not self._connected:
-            return
-        exc = None if task.cancelled() else task.exception()
-        _LOGGER.warning(
-            "Read loop ended unexpectedly (%r); tearing down connection", exc
-        )
-        asyncio.get_running_loop().create_task(self._teardown())
-
-    async def _watchdog_loop(self) -> None:
-        """Probe the link when RX has been idle; tear down if it's dead.
-
-        Some transports (serial-over-network proxies) can die without
-        delivering EOF or an exception. The ``?`` identify query is
-        answered in any power state, so an unanswered probe means the
-        link is gone; teardown lets the owner reconnect.
+        Gen 1 matchers return a decoded value (or ``None`` for no match); the
+        serialkit tracker wants a bool, so we bridge and re-run the matcher on
+        the resolved frame to return its decoded value.
         """
-        while self._connected:
-            await asyncio.sleep(WATCHDOG_INTERVAL)
-            if not self._connected:
-                return
-            if time.monotonic() - self._last_rx < WATCHDOG_INTERVAL:
-                continue
-            _LOGGER.debug(
-                "No RX for %.0f s; probing link with identify", WATCHDOG_INTERVAL
-            )
-            # A sleeping unit can consume the first frame as wake-up, so
-            # retry before declaring the link dead. An error reply counts
-            # as alive: any response proves the transport works.
-            for _ in range(WATCHDOG_PROBE_ATTEMPTS):
-                try:
-                    await self.identify()
-                    break
-                except Gen1CommandError:
-                    break
-                except (TimeoutError, ConnectionError, OSError):
-                    if not self._connected:
-                        return
-            else:
-                _LOGGER.warning(
-                    "Watchdog probes got no response; tearing down connection"
-                )
-                await self._teardown()
-                return
+
+        def accepts(frame: bytes) -> bool:
+            try:
+                return matcher(frame.decode("ascii", errors="replace").strip()) is not None
+            except Exception:  # noqa: BLE001 - a raising matcher is a no-match
+                return False
+
+        frame = await self.request(
+            command + TERMINATOR,
+            accepts,
+            timeout=self.request_timeout if timeout is None else timeout,
+        )
+        return matcher(frame.decode("ascii", errors="replace").strip())
 
     # -- Message processing ---------------------------------------------
 
@@ -447,40 +356,6 @@ class Gen1Receiver:
             return False
         setattr(target, attr, value)
         return True
-
-    def _process_message(self, message: str) -> None:
-        _LOGGER.debug("Received: %s", message)
-
-        # Errors first -- the receiver sometimes prepends/appends spaces.
-        err = match_error(message)
-        if err is not None:
-            self._dispatch_error(err)
-            return
-
-        changed = self._apply_event(message)
-
-        # Resolve the first pending query whose matcher accepts this frame.
-        for pending in list(self._pending_queries):
-            if pending.future.done():
-                continue
-            try:
-                value = pending.matcher(message)
-            except Exception:  # noqa: BLE001
-                value = None
-            if value is not None:
-                pending.future.set_result(value)
-                break
-
-        if changed:
-            self._notify_subscribers()
-
-    def _dispatch_error(self, phrase: str) -> None:
-        """Reject the oldest in-flight query with a CommandError."""
-        for pending in list(self._pending_queries):
-            if not pending.future.done():
-                pending.future.set_exception(Gen1CommandError(phrase))
-                return
-        _LOGGER.warning("Unsolicited error from receiver: %s", phrase)
 
     def _apply_event(self, message: str) -> bool:  # noqa: PLR0911
         """Update state from a received frame. Returns True when state changed."""
@@ -655,15 +530,6 @@ class Gen1Receiver:
         if zone == 3 and attr == "source":
             return self._set_attr(self._state.rec, attr, value)
         return False
-
-    def _notify_subscribers(self) -> None:
-        snapshot = self._state.copy() if self._connected else None
-        for callback in self._subscribers:
-            try:
-                callback(snapshot)
-            except Exception:  # noqa: BLE001
-                _LOGGER.exception("Error in state change callback %s", callback)
-
 
 # ---------------------------------------------------------------------------
 # Player abstractions

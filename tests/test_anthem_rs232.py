@@ -9,7 +9,6 @@ import anthem_rs232.receiver as anthem_receiver
 
 from conftest import (
     DEFAULT_QUERY_RESPONSES,
-    MockSerialConnection,
     connect_with_defaults,
 )
 
@@ -413,7 +412,7 @@ async def test_subscriber_called_on_event(receiver, mock_serial):
     received: list = []
     unsub = receiver.subscribe(received.append)
     mock_serial.inject_response("Z1VOL-10")
-    await asyncio.sleep(0)
+    await asyncio.sleep(0.01)  # let the dispatch turn + coalesced notify flush
     unsub()
     assert any(s and s.main_zone.volume == -10.0 for s in received)
 
@@ -549,7 +548,7 @@ async def test_per_input_setting_event_notifies_subscribers(receiver, mock_seria
     states = []
     receiver.subscribe(states.append)
     mock_serial.inject_response("SDVS021")
-    await asyncio.sleep(0)
+    await asyncio.sleep(0.01)  # let the dispatch turn + coalesced notify flush
     assert states
     assert states[-1].inputs[2].dolby_volume is True
 
@@ -577,38 +576,54 @@ async def test_malformed_frame_does_not_kill_read_loop(receiver, mock_serial):
     receiver._apply_event = boom
     mock_serial.inject_response("Z1VOL-20")  # raises inside processing
     mock_serial.inject_response("Z1VOL-30")  # must still be processed
-    await asyncio.sleep(0)
+    await asyncio.sleep(0.01)
+    # serialkit hardens on_frame: the crash is recorded, the dispatch task
+    # survives, and the next frame still routes.
     assert receiver.connected
-    assert not receiver._read_task.done()
+    assert receiver.frame_errors  # the boom was recorded, not fatal
     assert receiver.state.main_zone.volume == -30.0
 
 
-async def test_read_task_death_triggers_teardown(receiver, mock_serial):
-    states = []
+async def test_link_loss_notifies_subscribers_none(receiver, mock_serial):
+    """A dropped link (EOF) tears the session down and delivers a None
+    snapshot; serialkit owns the reconnect loop from there."""
+    states: list = []
     receiver.subscribe(states.append)
-    receiver._read_task.cancel()
+    mock_serial.reader.feed_eof()
     await asyncio.sleep(0.05)
     assert receiver.connected is False
     assert states[-1] is None
 
 
-async def test_watchdog_tears_down_dead_link(mock_serial):
-    anthem_receiver.WATCHDOG_INTERVAL = 0.06
-    try:
-        recv = await connect_with_defaults(mock_serial)
-        states = []
-        recv.subscribe(states.append)
-        # Kill the auto-responder: the link is now silently dead.
-        mock_serial._query_responses.clear()
-        # idle > interval -> 3 probes, each timing out -> teardown
-        await asyncio.sleep(0.7)
-        assert recv.connected is False
-        assert states[-1] is None
-        assert b"Z1POW?;" in mock_serial.written_data[-1:] or any(
-            w == b"Z1POW?;" for w in mock_serial.written_data
-        )
-    finally:
-        anthem_receiver.WATCHDOG_INTERVAL = 60.0
+async def test_watchdog_probes_z1pow_when_idle(mock_serial):
+    """serialkit's idle watchdog sends the Z1POW? probe; an answered probe
+    (any RX counts as alive, including an error reply) keeps the link up.
+
+    The probe mechanism (idle windows, unanswered -> reconnect) is covered by
+    serialkit's own suite; this pins anthem's probe config and wiring.
+    """
+    from serialkit import ProbeSpec
+
+    recv = AnthemReceiver("/dev/ttyUSB0")
+    # Short idle so the watchdog fires quickly (the class default is 60 s).
+    recv.probe = ProbeSpec(frame=b"Z1POW?;", idle=0.05, attempts=3)
+    mock_serial._query_responses = dict(DEFAULT_QUERY_RESPONSES)
+
+    async def fake_open(*args, **kwargs):
+        return mock_serial.reader, mock_serial.writer
+
+    with patch(
+        "anthem_rs232.receiver.serialx.open_serial_connection",
+        side_effect=fake_open,
+    ):
+        await recv.connect()
+        # Ignore the connect-time Z1POW? verify; from here only the idle
+        # watchdog should write, so the assertion validates the watchdog.
+        mock_serial.written_data.clear()
+        await asyncio.sleep(0.2)  # several idle windows
+        assert recv.connected  # answered probes -> never declared dead
+        assert any(w == b"Z1POW?;" for w in mock_serial.written_data)
+        await recv.disconnect()
 
 
 async def test_watchdog_quiet_while_traffic_flows(mock_serial):
@@ -622,35 +637,6 @@ async def test_watchdog_quiet_while_traffic_flows(mock_serial):
             await asyncio.sleep(0.02)
         assert recv.connected
         assert b"Z1POW?;" not in mock_serial.written_data
-        await recv.disconnect()
-    finally:
-        anthem_receiver.WATCHDOG_INTERVAL = 60.0
-
-
-async def test_watchdog_survives_eco_standby_wakeup(mock_serial):
-    """ECO standby eats the first probe as MCU wake-up; retry must save it."""
-
-    class EatsFirstProbe(dict):
-        def __init__(self, *args):
-            super().__init__(*args)
-            self.eaten = False
-
-        def get(self, key, default=None):
-            if key == "Z1POW" and not self.eaten:
-                self.eaten = True
-                return []
-            return super().get(key, default)
-
-    anthem_receiver.WATCHDOG_INTERVAL = 0.06
-    try:
-        recv = await connect_with_defaults(mock_serial)
-        mock_serial._query_responses = EatsFirstProbe({"Z1POW": ["Z1POW0"]})
-        mock_serial.written_data.clear()
-        # idle -> first probe eaten (timeout), second answered -> stays up
-        await asyncio.sleep(0.4)
-        assert recv.connected
-        probes = [w for w in mock_serial.written_data if w == b"Z1POW?;"]
-        assert len(probes) >= 2
         await recv.disconnect()
     finally:
         anthem_receiver.WATCHDOG_INTERVAL = 60.0

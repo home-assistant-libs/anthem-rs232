@@ -11,11 +11,12 @@ import anthem_rs232.receiver as anthem_receiver
 from anthem_rs232 import AnthemReceiver
 from anthem_rs232.models import ReceiverModel
 
-# Speed up tests by reducing delays.
+# Speed up tests by reducing delays. request_timeout is a serialkit class
+# attribute fixed at import, so override it on the class (patching the module
+# constant no longer affects it).
 anthem_rs232.COMMAND_TIMEOUT = 0.1
-anthem_rs232.PROBE_TIMEOUT = 0.01
 anthem_receiver.COMMAND_TIMEOUT = 0.1
-anthem_receiver.PROBE_TIMEOUT = 0.01
+AnthemReceiver.request_timeout = 0.1
 
 # Default responses for query prefixes used during connect()/query_state().
 # Each entry maps the queried prefix to a list of full response messages
