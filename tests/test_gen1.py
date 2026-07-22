@@ -15,7 +15,6 @@ from anthem_rs232.gen1 import (
     EffectMode,
     Gen1CommandError,
     Gen1Receiver,
-    Gen1ReceiverState,
     SleepTimer,
     Source,
     TunerBand,
@@ -40,8 +39,11 @@ from anthem_rs232.gen1.protocol import (
     split_lines,
 )
 
-# Speed up tests.
+# Speed up tests. request_timeout is a serialkit class attribute fixed at
+# import, so override it on the class (patching the module constant no longer
+# affects it).
 gen1_receiver_mod.COMMAND_TIMEOUT = 0.1
+Gen1Receiver.request_timeout = 0.1
 
 
 # -- dB helpers --------------------------------------------------------------
@@ -540,7 +542,7 @@ async def test_subscriber_called_on_event(gen1, mock_serial_gen1):
     received: list = []
     unsub = gen1.subscribe(received.append)
     mock_serial_gen1.feed(b"P1V-15.0")
-    await asyncio.sleep(0)
+    await asyncio.sleep(0.01)  # let the dispatch turn + coalesced notify flush
     unsub()
     assert any(s and s.main_zone.volume == -15.0 for s in received)
 
@@ -605,37 +607,49 @@ async def test_gen1_malformed_frame_does_not_kill_read_loop(gen1, mock_serial_ge
     gen1._apply_event = boom
     mock_serial_gen1.feed(b"P1VM-20.0")  # raises inside processing
     mock_serial_gen1.feed(b"P1VM-30.0")  # must still be processed
-    await asyncio.sleep(0)
+    await asyncio.sleep(0.01)
+    # serialkit hardens on_frame: the crash is recorded, dispatch survives.
     assert gen1.connected
-    assert not gen1._read_task.done()
+    assert gen1.frame_errors
     assert gen1.state.main_zone.volume == -30.0
 
 
-async def test_gen1_read_task_death_triggers_teardown(gen1, mock_serial_gen1):
-    states = []
+async def test_gen1_link_loss_notifies_subscribers_none(gen1, mock_serial_gen1):
+    """A dropped link (EOF) tears the session down and delivers a None
+    snapshot; serialkit owns the reconnect loop from there."""
+    states: list = []
     gen1.subscribe(states.append)
-    gen1._read_task.cancel()
+    mock_serial_gen1.reader.feed_eof()
     await asyncio.sleep(0.05)
     assert gen1.connected is False
     assert states[-1] is None
 
 
-async def test_gen1_watchdog_tears_down_dead_link(gen1, mock_serial_gen1):
-    gen1_receiver_mod.WATCHDOG_INTERVAL = 0.06
-    try:
-        # Restart the watchdog with the short interval.
-        gen1._watchdog_task.cancel()
-        gen1._watchdog_task = asyncio.create_task(gen1._watchdog_loop())
-        states = []
-        gen1.subscribe(states.append)
-        # Kill the identify auto-responder: the link is now silently dead.
-        mock_serial_gen1._handlers.clear()
-        # idle > interval -> 3 probes, each timing out -> teardown
-        await asyncio.sleep(0.7)
-        assert gen1.connected is False
-        assert states[-1] is None
-    finally:
-        gen1_receiver_mod.WATCHDOG_INTERVAL = 60.0
+async def test_gen1_watchdog_probes_identify_when_idle(mock_serial_gen1):
+    """serialkit's idle watchdog sends the identify probe (``?``); an answered
+    probe (any RX counts as alive, incl. an error reply) keeps the link up.
+
+    The probe mechanism (idle windows, unanswered -> reconnect) is covered by
+    serialkit's own suite; this pins gen1's probe config and wiring.
+    """
+    from serialkit import ProbeSpec
+
+    mock_serial_gen1.respond_to(b"?", b"(Statement D2,Version 3.10,Sep 1 2010)")
+    recv = Gen1Receiver("/dev/ttyUSB0", model=STATEMENT_D2)
+    recv.probe = ProbeSpec(frame=b"?\n", idle=0.05, attempts=3)
+
+    async def fake_open(*args, **kwargs):
+        return mock_serial_gen1.reader, mock_serial_gen1.writer
+
+    with patch(
+        "anthem_rs232.gen1.receiver.serialx.open_serial_connection",
+        side_effect=fake_open,
+    ):
+        await recv.connect()
+        await asyncio.sleep(0.2)  # several idle windows
+        assert recv.connected  # answered probes -> never declared dead
+        assert any(w == b"?\n" for w in mock_serial_gen1.written)
+        await recv.disconnect()
 
 
 # -- Standby NUL noise --

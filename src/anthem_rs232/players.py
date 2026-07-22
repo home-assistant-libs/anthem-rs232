@@ -19,7 +19,7 @@ from .protocol import (
     tone_to_param,
     volume_to_param,
 )
-from .state import MainZoneState, ZoneState
+from .state import ZoneState
 
 if TYPE_CHECKING:
     from .receiver import AnthemReceiver
@@ -28,13 +28,18 @@ if TYPE_CHECKING:
 class _BasePlayer:
     """Shared stateful control surface for a zone."""
 
-    def __init__(self, receiver: AnthemReceiver, zone: Zone, state: ZoneState) -> None:
+    def __init__(self, receiver: AnthemReceiver, zone: Zone) -> None:
         if zone is Zone.ALL:
             raise ValueError("Player zone must be MAIN, ZONE_2, or ZONE_3")
         self._receiver = receiver
         self._zone = zone
-        self._state = state
         self._zone_prefix = f"Z{zone.value}"
+
+    @property
+    def _state(self) -> ZoneState:
+        # Read-through to the receiver's live zone state, so a reconnect's
+        # fresh state object is always used (never a stale cached reference).
+        return self._receiver._zone_state(self._zone)
 
     @property
     def zone(self) -> Zone:
@@ -141,10 +146,8 @@ class _BasePlayer:
 class MainPlayer(_BasePlayer):
     """Stateful control surface for the main zone (Z1)."""
 
-    _state: MainZoneState
-
-    def __init__(self, receiver: AnthemReceiver, state: MainZoneState) -> None:
-        super().__init__(receiver, Zone.MAIN, state)
+    def __init__(self, receiver: AnthemReceiver) -> None:
+        super().__init__(receiver, Zone.MAIN)
 
     # -- Balance --
 

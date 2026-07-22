@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
-import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import serialx
+from serialkit import (
+    CommandTimeoutError,
+    DelimiterFramer,
+    ProbeSpec,
+    ProtocolError,
+    SerialDevice,
+    match_prefix,
+)
 
 from .const import (
     BAUD_RATE,
@@ -21,7 +27,6 @@ from .const import (
     MAX_LIP_SYNC_MS,
     MIN_DOLBY_VOLUME_LEVELER,
     MIN_LIP_SYNC_MS,
-    TERMINATOR,
     AudioInputChannels,
     AudioInputFormat,
     AudioListeningMode,
@@ -34,7 +39,6 @@ from .const import (
 )
 from .players import MainPlayer, ZonePlayer
 from .protocol import (
-    PendingQuery,
     parse_balance_param,
     parse_error_reply,
     parse_fm_frequency,
@@ -58,7 +62,7 @@ _PREFIXES_BY_LEN = tuple(
 )
 
 
-class CommandError(Exception):
+class CommandError(ProtocolError):
     """The receiver returned an error response (``!E/R/I/Z``)."""
 
     def __init__(self, kind: str, original: str) -> None:
@@ -67,8 +71,25 @@ class CommandError(Exception):
         self.original = original
 
 
-class AnthemReceiver:
-    """Async controller for an Anthem MRX 1120 / 720 / 520 / AVM 60 over RS232."""
+class AnthemReceiver(SerialDevice[ReceiverState]):
+    """Async controller for an Anthem MRX 1120 / 720 / 520 / AVM 60 over RS232.
+
+    Built on serialkit: framing (``;`` terminator, NUL scrub), matcher-based
+    query correlation, the read loop, an idle-window watchdog, and reconnect
+    are provided by :class:`serialkit.SerialDevice`. This class is the command
+    surface plus the event dispatcher (:meth:`_apply_event`).
+    """
+
+    framer_factory = staticmethod(lambda: DelimiterFramer(b";", strip=b"\x00"))
+    request_timeout = COMMAND_TIMEOUT
+    # Z1POW? is answered even in ECO standby; any RX (including an error reply)
+    # counts as alive, matching the old watchdog's alive-on-error semantics.
+    # attempts=3 covers ECO standby eating the first frame as MCU wake-up.
+    probe = ProbeSpec(
+        frame=b"Z1POW?;",
+        idle=WATCHDOG_INTERVAL,
+        attempts=WATCHDOG_PROBE_ATTEMPTS,
+    )
 
     def __init__(
         self,
@@ -77,18 +98,15 @@ class AnthemReceiver:
     ) -> None:
         self._port = port
         self._model = model
-        self._reader: asyncio.StreamReader | None = None
-        self._writer: serialx.SerialStreamWriter | None = None
-        self._read_task: asyncio.Task | None = None
-        self._watchdog_task: asyncio.Task | None = None
-        self._last_rx = 0.0
-        self._state = ReceiverState()
-        self.main = MainPlayer(self, self._state.main_zone)
-        self.zone_2 = ZonePlayer(self, Zone.ZONE_2, self._state.zone_2)
-        self._subscribers: list[StateCallback] = []
-        self._pending_queries: list[PendingQuery] = []
-        self._write_lock = asyncio.Lock()
-        self._connected = False
+        super().__init__(self._open_connection)
+        # A state object before start() so player/property reads work
+        # pre-connect; serialkit rebuilds it via make_state() per connection.
+        self.state = self.make_state()
+        self.main = MainPlayer(self)
+        self.zone_2 = ZonePlayer(self, Zone.ZONE_2)
+
+    async def _open_connection(self) -> tuple[object, object]:
+        return await serialx.open_serial_connection(self._port, baudrate=BAUD_RATE)
 
     # -- Properties --
 
@@ -98,68 +116,87 @@ class AnthemReceiver:
         return self._model
 
     @property
-    def state(self) -> ReceiverState:
-        """Return a deep copy of the current state."""
-        return self._state.copy()
-
-    @property
-    def connected(self) -> bool:
-        return self._connected
-
-    @property
     def power(self) -> bool | None:
         """Return the current chassis power state (any zone on)."""
         return self._state.power
 
-    # -- Subscriptions --
+    # -- serialkit lifecycle callbacks --
 
-    def subscribe(self, callback: StateCallback) -> Callable[[], None]:
-        """Subscribe to state changes. Returns an unsubscribe function."""
-        self._subscribers.append(callback)
-        return lambda: self._subscribers.remove(callback)
+    def make_state(self) -> ReceiverState:
+        return ReceiverState()
 
-    # -- Connection lifecycle --
+    def copy_state(self, state: ReceiverState) -> ReceiverState:
+        return state.copy()
 
-    async def connect(self) -> None:
-        """Open the serial connection, verify with Z1POW?, enable auto-reports."""
-        self._reader, self._writer = await serialx.open_serial_connection(
-            self._port,
-            baudrate=BAUD_RATE,
-        )
-        self._connected = True
-        self._read_task = asyncio.create_task(self._read_loop())
-        self._read_task.add_done_callback(self._on_read_task_done)
-        self._last_rx = time.monotonic()
-        self._watchdog_task = asyncio.create_task(self._watchdog_loop())
+    @property
+    def _state(self) -> ReceiverState:
+        """The live receiver state.
 
-        # Use Z1POW? for the verification probe -- the spec lists it (along
-        # with IDM? and ZxPOWy) as one of the few commands that work even
-        # while the system is in standby, and it always returns a payload.
-        # Some serial proxies drop the first frame after subscribe; retry a
-        # few times before giving up.
+        Read-through so the event dispatcher and the zone players always see
+        the current connection's state object (serialkit rebuilds it on every
+        reconnect); mutating sub-objects in place still works.
+        """
+        assert self.state is not None
+        return self.state
+
+    def _zone_state(self, zone: Zone) -> ZoneState:
+        """The live state for a zone (used by the players' read-through)."""
+        return self._state.main_zone if zone is Zone.MAIN else self._state.zone_2
+
+    async def on_connect(self) -> None:
+        """Verify the link (Z1POW?) and enable auto-reports (ECH1).
+
+        Runs on every (re)connection with frames already flowing. Z1POW? is
+        answered even in standby; proxies sometimes drop the first frame, so
+        retry a few times before declaring the link dead.
+        """
         for attempt in range(3):
             try:
                 await self._query("Z1POW")
                 break
-            except (TimeoutError, CommandError):
+            except (CommandTimeoutError, CommandError):
                 if attempt == 2:
-                    await self.disconnect()
                     raise ConnectionError(
                         f"No response from receiver on {self._port}"
                     ) from None
-
-        # Turn on auto-reports so external state changes (front panel, IR
-        # remote, IP) propagate to subscribers.
         try:
             await self._send_command("ECH", "1")
         except CommandError:
             _LOGGER.debug("ECH1 rejected; continuing without auto-reports")
 
+    def on_frame(self, frame: bytes) -> None:
+        """Route one framed message: apply state first, then resolve/reject."""
+        message = frame.decode("ascii", errors="replace").strip()
+        if not message:
+            return
+        error = parse_error_reply(message)
+        if error is not None:
+            # Errors echo the original command (``!RZ1VOL+50``); reject every
+            # pending whose matcher accepts the echoed content (gen2 rejects
+            # the whole matching set, not just the oldest).
+            self.pending.reject_matched(
+                error.original.encode("ascii"),
+                CommandError(error.kind.value, error.original),
+                all=True,
+            )
+            return
+        prefix = self._match_prefix(message)
+        if prefix is not None:
+            param = message[len(prefix):]
+            if self._apply_event(prefix, param):
+                self.notify()
+        self.pending.feed(frame)
+
+    # -- Connection lifecycle (aliases over serialkit start/stop) --
+
+    async def connect(self) -> None:
+        """Open the serial connection, verify, and enable auto-reports."""
+        await self.start()
         _LOGGER.info("Connected to Anthem receiver on %s", self._port)
 
     async def disconnect(self) -> None:
         """Close the serial connection."""
-        await self._teardown()
+        await self.stop()
         _LOGGER.info("Disconnected from Anthem receiver")
 
     # -- Identification --
@@ -411,174 +448,19 @@ class AnthemReceiver:
     # -- Low-level command helpers --
 
     async def _send_command(self, command: str, parameter: str) -> None:
-        """Send a command (no response expected beyond the ``;`` ack)."""
-        assert self._writer is not None
-        msg = f"{command}{parameter};".encode("ascii")
-        _LOGGER.debug("Sending: %s", msg)
-        try:
-            async with self._write_lock:
-                self._writer.write(msg)
-                await self._writer.drain()
-        except Exception:
-            _LOGGER.exception("Error writing to serial port")
-            await self._teardown()
-            raise
+        """Send a command (fire-and-forget; the echo returns as an event)."""
+        await self.send(f"{command}{parameter};".encode("ascii"))
 
     async def _query(self, command: str) -> str:
-        """Send a query (``COMMAND?;``) and wait for the response payload."""
-        assert self._writer is not None
-        loop = asyncio.get_running_loop()
-        future: asyncio.Future[str] = loop.create_future()
-        pending = PendingQuery(prefix=command, future=future)
-        self._pending_queries.append(pending)
-        try:
-            msg = f"{command}?;".encode("ascii")
-            _LOGGER.debug("Querying: %s", msg)
-            try:
-                async with self._write_lock:
-                    self._writer.write(msg)
-                    await self._writer.drain()
-            except Exception:
-                _LOGGER.exception("Error writing to serial port")
-                await self._teardown()
-                raise
-            return await asyncio.wait_for(future, timeout=COMMAND_TIMEOUT)
-        finally:
-            if pending in self._pending_queries:
-                self._pending_queries.remove(pending)
+        """Send a query (``COMMAND?;``) and return the response payload.
 
-    # -- Read loop --
-
-    async def _teardown(self) -> None:
-        """Tear down the connection after disconnect or an error."""
-        if not self._connected:
-            return
-        self._connected = False
-
-        current = asyncio.current_task()
-        if self._read_task is not None and self._read_task is not current:
-            self._read_task.cancel()
-            try:
-                await self._read_task
-            except asyncio.CancelledError:
-                pass
-        self._read_task = None
-
-        if self._watchdog_task is not None and self._watchdog_task is not current:
-            self._watchdog_task.cancel()
-            try:
-                await self._watchdog_task
-            except asyncio.CancelledError:
-                pass
-        self._watchdog_task = None
-
-        if self._writer is not None:
-            self._writer.close()
-            await self._writer.wait_closed()
-            self._writer = None
-            self._reader = None
-
-        # Resolve any pending queries with a TimeoutError to unblock callers.
-        for pending in self._pending_queries:
-            if not pending.future.done():
-                pending.future.set_exception(TimeoutError("Connection lost"))
-        self._pending_queries.clear()
-
-        self._notify_subscribers()
-
-    async def _read_loop(self) -> None:
-        """Continuously read messages, splitting on the ``;`` terminator."""
-        assert self._reader is not None
-        buf = b""
-
-        while self._connected:
-            try:
-                data = await self._reader.read(256)
-            except Exception:
-                if not self._connected:
-                    return
-                _LOGGER.exception("Error reading from serial port")
-                await self._teardown()
-                return
-
-            if not data:
-                _LOGGER.warning("Serial connection closed")
-                await self._teardown()
-                return
-
-            self._last_rx = time.monotonic()
-            # Receivers emit stray NUL bytes around standby transitions
-            # (~1 s after each response while dozing). The protocol is
-            # pure ASCII; a NUL left in the buffer glues onto the next
-            # frame and breaks prefix matching, so drop them.
-            data = data.replace(b"\x00", b"")
-            if not data:
-                continue
-            buf += data
-            while TERMINATOR in buf:
-                line, buf = buf.split(TERMINATOR, 1)
-                if not line:
-                    continue
-                message = line.decode("ascii", errors="replace").strip()
-                if not message:
-                    continue
-                # One malformed frame must never kill the read loop: a dead
-                # loop leaves a connected, subscribed session nobody drains.
-                try:
-                    self._process_message(message)
-                except Exception:
-                    _LOGGER.exception("Error processing message %r; skipping", message)
-
-    def _on_read_task_done(self, task: asyncio.Task) -> None:
-        """Tear down if the read loop ends while still connected.
-
-        The loop should only end via teardown; anything else (an escaped
-        exception, a stray cancellation) would otherwise leave a live,
-        subscribed session whose data is never read.
+        The response frame starts with the query prefix; the returned value is
+        the payload after it (matching the old pending-by-startswith behavior).
         """
-        if not self._connected:
-            return
-        exc = None if task.cancelled() else task.exception()
-        _LOGGER.warning(
-            "Read loop ended unexpectedly (%r); tearing down connection", exc
+        frame = await self.request(
+            f"{command}?;".encode("ascii"), match_prefix(command.encode("ascii"))
         )
-        asyncio.get_running_loop().create_task(self._teardown())
-
-    async def _watchdog_loop(self) -> None:
-        """Probe the link when RX has been idle; tear down if it's dead.
-
-        Some transports (serial-over-network proxies) can die without
-        delivering EOF or an exception, leaving an idle-but-dead session.
-        Z1POW? is answered even in standby, so an unanswered probe means
-        the link is gone; teardown lets the owner reconnect.
-        """
-        while self._connected:
-            await asyncio.sleep(WATCHDOG_INTERVAL)
-            if not self._connected:
-                return
-            if time.monotonic() - self._last_rx < WATCHDOG_INTERVAL:
-                continue
-            _LOGGER.debug(
-                "No RX for %.0f s; probing link with Z1POW?", WATCHDOG_INTERVAL
-            )
-            # A unit in ECO standby consumes the first frame as wake-up, so
-            # retry before declaring the link dead. An error reply counts as
-            # alive: any response proves the transport works.
-            for _ in range(WATCHDOG_PROBE_ATTEMPTS):
-                try:
-                    await self._query("Z1POW")
-                    break
-                except CommandError:
-                    break
-                except (TimeoutError, ConnectionError, OSError):
-                    if not self._connected:
-                        return
-            else:
-                _LOGGER.warning(
-                    "Watchdog probes got no response; tearing down connection"
-                )
-                await self._teardown()
-                return
+        return frame.decode("ascii", errors="replace").strip()[len(command):]
 
     # -- Message processing --
 
@@ -595,51 +477,12 @@ class AnthemReceiver:
     def _set_zone2_value(self, attr: str, new_value: object) -> bool:
         return self._set_attr_value(self._state.zone_2, attr, new_value)
 
-    def _process_message(self, message: str) -> None:
-        """Parse one terminated line from the receiver."""
-        _LOGGER.debug("Received: %s", message)
-
-        error = parse_error_reply(message)
-        if error is not None:
-            self._dispatch_error(error.original, error.kind.value)
-            return
-
-        prefix = self._match_prefix(message)
-        if prefix is None:
-            _LOGGER.debug("Unhandled message: %s", message)
-            return
-
-        param = message[len(prefix) :]
-        changed = self._apply_event(prefix, param)
-
-        # Match pendings by startswith, not equality with the table prefix:
-        # query prefixes may extend a table entry with an index or channel
-        # (SPN1, Z1LEV3, SLIP02), and each pending gets the payload after its
-        # own prefix.
-        for pending in list(self._pending_queries):
-            if message.startswith(pending.prefix) and not pending.future.done():
-                pending.future.set_result(message[len(pending.prefix) :])
-
-        if changed:
-            self._notify_subscribers()
-
     @staticmethod
     def _match_prefix(message: str) -> str | None:
         for prefix in _PREFIXES_BY_LEN:
             if message.startswith(prefix):
                 return prefix
         return None
-
-    def _dispatch_error(self, original: str, kind: str) -> None:
-        """Reject any pending query whose command is echoed in an error."""
-        for pending in list(self._pending_queries):
-            # Errors are returned as e.g. ``!RZ1VOL+50;`` -- the original
-            # command (without the trailing ``?`` for queries) is echoed back.
-            if (
-                original.startswith(pending.prefix)
-                and not pending.future.done()
-            ):
-                pending.future.set_exception(CommandError(kind, original))
 
     def _apply_event(self, prefix: str, param: str) -> bool:  # noqa: PLR0911 -- dispatcher
         """Update state from an event/response. Returns True when state changed."""
@@ -910,14 +753,6 @@ class AnthemReceiver:
         if op == "CTL":
             return self._set_attr_value(state, "rs232_controlled", param == "1")
         return self._set_attr_value(state, "on", param == "1")
-
-    def _notify_subscribers(self) -> None:
-        snapshot = self._state.copy() if self._connected else None
-        for callback in self._subscribers:
-            try:
-                callback(snapshot)
-            except Exception:
-                _LOGGER.exception("Error in state change callback %s", callback)
 
 
 def _validate_input_index(input_index: int) -> None:

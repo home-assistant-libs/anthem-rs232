@@ -6,7 +6,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from anthem_rs232 import probe
-from anthem_rs232.probe import ProbeResult
 
 
 class _MockSerial:
