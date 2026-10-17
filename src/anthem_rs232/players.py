@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, TypeAlias
+from typing import TYPE_CHECKING
 
 from .const import (
     AudioListeningMode,
@@ -337,4 +337,4 @@ class ZonePlayer(_BasePlayer):
     """Stateful control surface for a non-main zone (Zone 2)."""
 
 
-AnthemPlayer: TypeAlias = MainPlayer | ZonePlayer
+type AnthemPlayer = MainPlayer | ZonePlayer

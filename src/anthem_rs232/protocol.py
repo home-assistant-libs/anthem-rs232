@@ -28,7 +28,7 @@ def parse_volume_param(param: str) -> float:
 
 def volume_to_param(db: float) -> str:
     """Convert a dB value to a Z?VOLsyy parameter."""
-    rounded = int(round(db))
+    rounded = round(db)
     sign = "-" if rounded < 0 else "+"
     return f"{sign}{abs(rounded):02d}"
 
@@ -45,7 +45,7 @@ def parse_level_param(param: str) -> tuple[int, float]:
 
 def level_to_param(channel: int, db: float) -> str:
     """Format a Z1LEVyszz parameter from channel index + dB."""
-    rounded = int(round(db))
+    rounded = round(db)
     sign = "-" if rounded < 0 else "+"
     return f"{channel}{sign}{abs(rounded):02d}"
 
@@ -62,7 +62,7 @@ def parse_tone_param(param: str) -> tuple[int, float]:
 
 def tone_to_param(axis: int, db: float) -> str:
     """Format a Z1TONyszz parameter from axis (0/1) + dB."""
-    rounded = int(round(db))
+    rounded = round(db)
     sign = "-" if rounded < 0 else "+"
     return f"{axis}{sign}{abs(rounded):02d}"
 
