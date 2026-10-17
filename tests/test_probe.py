@@ -179,9 +179,8 @@ async def test_probe_custom_attempts_can_skip_gen2():
 
 async def test_probe_invalid_generation_raises():
     """Passing a generation other than 1 or 2 raises ValueError."""
-    with _patch_open({}):
-        with pytest.raises(ValueError):
-            await probe("/dev/ttyUSB0", timeout=0.05, attempts=((9, 9600),))
+    with _patch_open({}), pytest.raises(ValueError):
+        await probe("/dev/ttyUSB0", timeout=0.05, attempts=((9, 9600),))
 
 
 # -- Open failure handling --------------------------------------------------

@@ -4,14 +4,12 @@ import asyncio
 from unittest.mock import patch
 
 import pytest
-
-import anthem_rs232.receiver as anthem_receiver
-
 from conftest import (
     DEFAULT_QUERY_RESPONSES,
     connect_with_defaults,
 )
 
+import anthem_rs232.receiver as anthem_receiver
 from anthem_rs232 import (
     AnthemReceiver,
     AudioInputChannels,
@@ -36,7 +34,6 @@ from anthem_rs232 import (
     _tone_to_param,
     _volume_to_param,
 )
-
 
 # -- Volume conversion --
 

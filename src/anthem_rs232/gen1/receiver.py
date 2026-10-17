@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, TypeAlias
+from typing import TYPE_CHECKING, Any
 
 import serialx
 from serialkit import (
@@ -17,8 +17,6 @@ from serialkit import (
 
 from .const import (
     COMMAND_TIMEOUT,
-    WATCHDOG_INTERVAL,
-    WATCHDOG_PROBE_ATTEMPTS,
     HEADPHONE_VOLUME_STEP,
     MAIN_VOLUME_STEP,
     MAX_AM_FREQUENCY,
@@ -27,6 +25,8 @@ from .const import (
     MIN_FM_FREQUENCY,
     TERMINATOR,
     TRIM_STEP,
+    WATCHDOG_INTERVAL,
+    WATCHDOG_PROBE_ATTEMPTS,
     ZONE2_TONE_STEP,
     ZONE2_VOLUME_STEP,
     DecoderMode,
@@ -71,7 +71,7 @@ if TYPE_CHECKING:
 
 _LOGGER = logging.getLogger(__name__)
 
-StateCallback: TypeAlias = Callable[[Gen1ReceiverState | None], None]
+type StateCallback = Callable[[Gen1ReceiverState | None], None]
 
 
 class Gen1CommandError(ProtocolError):
@@ -360,7 +360,7 @@ class Gen1Receiver(SerialDevice[Gen1ReceiverState]):
         setattr(target, attr, value)
         return True
 
-    def _apply_event(self, message: str) -> bool:  # noqa: PLR0911
+    def _apply_event(self, message: str) -> bool:
         """Update state from a received frame. Returns True when state changed."""
         # Identify response: ``(AVM 2,Version 1.00,Jun 26 2000)``.
         info = parse_version(message)
