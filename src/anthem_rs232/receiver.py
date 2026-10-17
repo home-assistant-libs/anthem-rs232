@@ -106,7 +106,10 @@ class AnthemReceiver(SerialDevice[ReceiverState]):
         self.zone_2 = ZonePlayer(self, Zone.ZONE_2)
 
     async def _open_connection(self) -> tuple[object, object]:
-        return await serialx.open_serial_connection(self._port, baudrate=BAUD_RATE)
+        try:
+            return await serialx.open_serial_connection(self._port, baudrate=BAUD_RATE)
+        except serialx.SerialException as err:
+            raise ConnectionError(str(err)) from err
 
     # -- Properties --
 

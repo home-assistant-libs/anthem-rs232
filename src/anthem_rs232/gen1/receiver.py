@@ -132,9 +132,12 @@ class Gen1Receiver(SerialDevice[Gen1ReceiverState]):
         self.tuner = Tuner(self)
 
     async def _open_connection(self) -> tuple[object, object]:
-        return await serialx.open_serial_connection(
-            self._port, baudrate=self._baud_rate
-        )
+        try:
+            return await serialx.open_serial_connection(
+                self._port, baudrate=self._baud_rate
+            )
+        except serialx.SerialException as err:
+            raise ConnectionError(str(err)) from err
 
     # -- Properties -------------------------------------------------------
 
